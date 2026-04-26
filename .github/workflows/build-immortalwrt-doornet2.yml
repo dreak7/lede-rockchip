@@ -1,0 +1,117 @@
+name: Build DoorNet2 (RK3399) ImmortalWrt
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-immortalwrt-doornet2.yml'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-23.05
+  HW_REPO_URL: https://github.com/DHDAXCW/lede-rockchip
+  HW_REPO_BRANCH: stable
+  TZ: America/Los_Angeles
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout Actions Repo
+      uses: actions/checkout@v4
+
+    - name: Initialization Environment (P3TERX Framework)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    - name: Clone Source Code
+      run: |
+        git clone -b $REPO_BRANCH $REPO_URL openwrt
+        git clone -b $HW_REPO_BRANCH $HW_REPO_URL lede-rockchip
+
+    - name: Port DoorNet2 Hardware Support
+      working-directory: ./openwrt
+      run: |
+        # 精准移植 RK3399 DoorNet2 的设备树文件 (DTS)
+        mkdir -p target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/
+        cp -r ../lede-rockchip/target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/*doornet2* target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/ || true
+
+        # 注册 RK3399 架构的 DoorNet2 设备
+        cat <<EOF >> target/linux/rockchip/image/Makefile
+        
+        define Device/embedfire_doornet2
+          DEVICE_VENDOR := EmbedFire
+          DEVICE_MODEL := DoorNet2
+          SOC := rk3399
+          DEVICE_DTS := rockchip/rk3399-doornet2
+          DEVICE_PACKAGES := kmod-r8169 kmod-usb-net-rtl8152
+        endef
+        TARGET_DEVICES += embedfire_doornet2
+        EOF
+
+    - name: Update and Install Feeds
+      working-directory: ./openwrt
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Generate Firmware Configuration (.config)
+      working-directory: ./openwrt
+      run: |
+        touch .config
+        
+        # 1. 指定底层架构为 Rockchip ARMv8 (RK3399)
+        echo "CONFIG_TARGET_rockchip=y" >> .config
+        echo "CONFIG_TARGET_rockchip_armv8=y" >> .config
+        echo "CONFIG_TARGET_PROFILE=\"embedfire_doornet2\"" >> .config
+        
+        # 2. 注入 Docker 核心组件及可视化面板
+        echo "CONFIG_PACKAGE_luci-app-dockerman=y" >> .config
+        echo "CONFIG_PACKAGE_docker=y" >> .config
+        echo "CONFIG_PACKAGE_dockerd=y" >> .config
+        
+        # 3. 注入 Docker 所需的底层网络与存储支持
+        echo "CONFIG_PACKAGE_kmod-veth=y" >> .config
+        echo "CONFIG_PACKAGE_block-mount=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-fs-ext4=y" >> .config
+        
+        # 使用 defconfig 自动扩展和校验完整的依赖树
+        make defconfig
+
+    - name: Download Package Dependencies
+      working-directory: ./openwrt
+      run: |
+        make download -j8
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile Firmware
+      working-directory: ./openwrt
+      run: |
+        echo "Starting P3TERX style compilation..."
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Organize Firmware Output
+      id: organize
+      working-directory: ./openwrt
+      run: |
+        rm -rf bin/targets/*/*/packages
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload Firmware to Artifacts
+      if: steps.organize.outputs.status == 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ImmortalWrt_DoorNet2_RK3399_Docker
+        path: openwrt/bin/targets/*/*
